@@ -1,20 +1,43 @@
 import copy
+import os
 import random
+
+os.environ["MPLCONFIGDIR"] = "/tmp/matplotlib"
+os.environ["XDG_CACHE_HOME"] = "/tmp"
 
 import numpy as np
 import torch
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
-from milp_certification import solve_certification_milp
-
 
 # Numerical setup from the paper.
+GUROBI_LICENSE_FILE = "/Users/marco/Downloads/gurobi (3).lic"
+os.environ["GRB_LICENSE_FILE"] = GUROBI_LICENSE_FILE
+
+from milp_certification import solve_certification_milp
+
 T = 5
-CERTIFICATION_HORIZON = 1
+CERTIFICATION_HORIZON = 5
+HORIZON_SWEEP = True
+SOLVER_BACKEND = "gurobi"
+REFERENCE_HIDDEN_LAYERS = 1
+REFERENCE_NEURONS = 16
+CANDIDATE_HIDDEN_LAYERS = 1
+CANDIDATE_NEURONS = 8
 MILP_TIME_LIMIT = 600.0
 MILP_THREADS = 8
+MILP_RELATIVE_GAP = 1e-2
+MILP_BIG_M = None
+MILP_P = None
 DATA_BOUNDS_MARGIN = 0.05
+GRADIENT_ASCENT_RESTARTS = 20
+GRADIENT_ASCENT_STEPS = 300
+GRADIENT_ASCENT_LR = 0.05
 N_TRAIN = 20_000
 N_VAL = 2_000
 NOISE_STD = 0.02
@@ -22,7 +45,7 @@ NOISE_STD = 0.02
 U_MIN = -2.0
 U_MAX = 2.0
 X_MIN = 0.0
-X_MAX = 10.0
+X_MAX = 5.0
 
 K1 = 0.5
 K2 = 0.4
@@ -30,6 +53,10 @@ K3 = 0.2
 K4 = 0.3
 
 SEED = 1
+MODEL_FILE = "trained_models.pt"
+FORCE_RETRAIN = False
+TRAJECTORY_PLOT_FILE = "output_trajectory.png"
+INPUT_PLOT_FILE = "input_sequence.png"
 
 
 def set_seed(seed):
@@ -253,6 +280,270 @@ def extract_weights_and_biases(model):
     return weights, biases
 
 
+def checkpoint_matches_setup(checkpoint, input_size, output_size):
+    setup = checkpoint.get("setup", {})
+
+    if setup.get("T") != T:
+        return False
+    if setup.get("input_size") != input_size:
+        return False
+    if setup.get("output_size") != output_size:
+        return False
+    if setup.get("reference_hidden_layers") != REFERENCE_HIDDEN_LAYERS:
+        return False
+    if setup.get("reference_neurons") != REFERENCE_NEURONS:
+        return False
+    if setup.get("candidate_hidden_layers") != CANDIDATE_HIDDEN_LAYERS:
+        return False
+    if setup.get("candidate_neurons") != CANDIDATE_NEURONS:
+        return False
+    if setup.get("x_max") != X_MAX:
+        return False
+    if setup.get("u_min") != U_MIN:
+        return False
+    if setup.get("u_max") != U_MAX:
+        return False
+
+    return True
+
+
+def save_models(reference_model, candidate_model, input_size, output_size):
+    reference_weights, reference_biases = extract_weights_and_biases(reference_model)
+    candidate_weights, candidate_biases = extract_weights_and_biases(candidate_model)
+
+    torch.save(
+        {
+            "reference": reference_model.state_dict(),
+            "candidate": candidate_model.state_dict(),
+            "reference_weights": reference_weights,
+            "reference_biases": reference_biases,
+            "candidate_weights": candidate_weights,
+            "candidate_biases": candidate_biases,
+            "setup": {
+                "T": T,
+                "u_min": U_MIN,
+                "u_max": U_MAX,
+                "x_min": X_MIN,
+                "x_max": X_MAX,
+                "noise_std": NOISE_STD,
+                "input_size": input_size,
+                "output_size": output_size,
+                "reference_hidden_layers": REFERENCE_HIDDEN_LAYERS,
+                "reference_neurons": REFERENCE_NEURONS,
+                "candidate_hidden_layers": CANDIDATE_HIDDEN_LAYERS,
+                "candidate_neurons": CANDIDATE_NEURONS,
+            },
+        },
+        MODEL_FILE,
+    )
+
+
+def find_initial_information_with_gradient_ascent(
+    reference_model,
+    candidate_model,
+    information_lower,
+    information_upper,
+    restarts,
+    steps,
+    learning_rate,
+):
+    lower = torch.from_numpy(information_lower.astype(np.float32))
+    upper = torch.from_numpy(information_upper.astype(np.float32))
+
+    reference_model.eval()
+    candidate_model.eval()
+
+    best_information = None
+    best_value = -1.0
+
+    for restart in range(restarts):
+        random_point = lower + torch.rand_like(lower) * (upper - lower)
+        information = random_point.clone().detach().requires_grad_(True)
+        optimizer = torch.optim.Adam([information], lr=learning_rate)
+
+        for _ in range(steps):
+            reference_output = reference_model(information.reshape(1, -1))
+            candidate_output = candidate_model(information.reshape(1, -1))
+            error = torch.max(torch.abs(candidate_output - reference_output))
+            loss = -error
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            with torch.no_grad():
+                information.copy_(torch.maximum(torch.minimum(information, upper), lower))
+
+        with torch.no_grad():
+            reference_output = reference_model(information.reshape(1, -1))
+            candidate_output = candidate_model(information.reshape(1, -1))
+            error = torch.max(torch.abs(candidate_output - reference_output)).item()
+
+        if error > best_value:
+            best_value = error
+            best_information = information.detach().numpy().copy()
+
+        print(
+            "gradient ascent restart",
+            restart + 1,
+            "of",
+            restarts,
+            "- best error:",
+            round(best_value, 6),
+        )
+
+    return best_information, best_value
+
+
+def run_certification(
+    reference_weights,
+    reference_biases,
+    candidate_weights,
+    candidate_biases,
+    information_lower,
+    information_upper,
+    initial_information,
+    horizon,
+):
+    print("Solving certification MILP with horizon", horizon)
+    certification = solve_certification_milp(
+        reference_weights,
+        reference_biases,
+        candidate_weights,
+        candidate_biases,
+        horizon=horizon,
+        window_length=T,
+        y_min=X_MIN,
+        y_max=X_MAX,
+        u_min=U_MIN,
+        u_max=U_MAX,
+        information_lower=information_lower,
+        information_upper=information_upper,
+        initial_information=initial_information,
+        warmup_steps=T,
+        big_m_value=MILP_BIG_M,
+        error_bound=MILP_P,
+        time_limit=MILP_TIME_LIMIT,
+        num_threads=MILP_THREADS,
+        mip_relative_gap=MILP_RELATIVE_GAP,
+        solver_backend=SOLVER_BACKEND,
+        show_solver_output=True,
+    )
+
+    milp_result = certification["result"]
+    if isinstance(milp_result, dict):
+        success = milp_result["success"]
+        status = milp_result["status"]
+        message = milp_result["message"]
+    else:
+        success = milp_result.success
+        status = milp_result.status
+        message = milp_result.message
+
+    print("MILP success:", success)
+    print("MILP status:", status)
+    print("MILP message:", message)
+    print("Certified objective:", certification["objective_value"])
+    print("MILP error bound P:", certification["error_bound"])
+    return certification
+
+
+def get_input_sequence_from_certification(certification):
+    solution = certification["solution"]
+    input_variables = certification["input_variables"]
+
+    if solution is None:
+        return None
+
+    input_sequence = []
+    for variables in input_variables:
+        input_sequence.append(solution[variables].copy())
+
+    return np.array(input_sequence, dtype=np.float32)
+
+
+def rollout_reference_candidate(reference_model, candidate_model, initial_information, input_sequence):
+    information = initial_information.astype(np.float32).copy()
+    reference_outputs = []
+    candidate_outputs = []
+
+    reference_model.eval()
+    candidate_model.eval()
+
+    for k in range(input_sequence.shape[0] + 1):
+        information_tensor = torch.from_numpy(information.reshape(1, -1))
+
+        with torch.no_grad():
+            reference_output = reference_model(information_tensor).numpy().reshape(-1)
+            candidate_output = candidate_model(information_tensor).numpy().reshape(-1)
+
+        reference_outputs.append(reference_output[0])
+        candidate_outputs.append(candidate_output[0])
+
+        if k < input_sequence.shape[0]:
+            new_information = []
+            for i in range(1, T):
+                old_index = 2 * i
+                new_information.append(information[old_index])
+                new_information.append(information[old_index + 1])
+
+            new_information.append(reference_output[0])
+            new_information.append(input_sequence[k, 0])
+            information = np.array(new_information, dtype=np.float32)
+
+    return np.array(reference_outputs), np.array(candidate_outputs)
+
+
+def plot_output_trajectory(reference_outputs, candidate_outputs, comparison_start, output_file):
+    time_indexes = np.arange(reference_outputs.shape[0])
+    candidate_to_plot = candidate_outputs.copy()
+    candidate_to_plot[:comparison_start] = np.nan
+    error_to_plot = np.abs(candidate_outputs - reference_outputs)
+    error_to_plot[:comparison_start] = np.nan
+
+    figure, axes = plt.subplots(2, 1, figsize=(8, 6), sharex=True)
+
+    axes[0].plot(time_indexes, reference_outputs, marker="o", label="reference")
+    axes[0].plot(time_indexes, candidate_to_plot, marker="s", label="candidate")
+    axes[0].axvline(comparison_start, color="black", linestyle="--", linewidth=1.2, label="certification starts")
+    axes[0].set_ylabel("y")
+    axes[0].grid(True)
+    axes[0].legend()
+
+    axes[1].plot(time_indexes, error_to_plot, marker="d", color="tab:red", label="absolute error")
+    axes[1].axvline(comparison_start, color="black", linestyle="--", linewidth=1.2)
+    axes[1].set_xlabel("k")
+    axes[1].set_ylabel("|error|")
+    axes[1].grid(True)
+    axes[1].legend()
+
+    plt.tight_layout()
+    plt.savefig(output_file, dpi=200)
+    plt.close()
+
+
+def print_input_sequence(input_sequence):
+    print("Optimized input sequence:")
+    for k in range(input_sequence.shape[0]):
+        print("u_" + str(k) + " =", float(input_sequence[k, 0]))
+
+
+def plot_input_sequence(input_sequence, comparison_start, output_file):
+    time_indexes = np.arange(input_sequence.shape[0])
+
+    plt.figure(figsize=(8, 3.2))
+    plt.step(time_indexes, input_sequence[:, 0], where="post", label="input")
+    plt.plot(time_indexes, input_sequence[:, 0], marker="o", linestyle="None")
+    plt.axvline(comparison_start, color="black", linestyle="--", linewidth=1.2, label="certification starts")
+    plt.xlabel("k")
+    plt.ylabel("u")
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(output_file, dpi=200)
+    plt.close()
+
+
 def main():
     set_seed(SEED)
 
@@ -271,20 +562,59 @@ def main():
     input_size = train_x.shape[1]
     output_size = train_y.shape[1]
 
-    reference = ReluMlp(input_size, hidden_layers=1, neurons_per_layer=16, output_size=output_size)
-    candidate = ReluMlp(input_size, hidden_layers=1, neurons_per_layer=8, output_size=output_size)
+    reference = ReluMlp(
+        input_size,
+        hidden_layers=REFERENCE_HIDDEN_LAYERS,
+        neurons_per_layer=REFERENCE_NEURONS,
+        output_size=output_size,
+    )
+    candidate = ReluMlp(
+        input_size,
+        hidden_layers=CANDIDATE_HIDDEN_LAYERS,
+        neurons_per_layer=CANDIDATE_NEURONS,
+        output_size=output_size,
+    )
 
     print("Reference parameters:", count_parameters(reference))
     print("Candidate parameters:", count_parameters(candidate))
 
-    print("Training reference network")
-    train_model(reference, train_x_norm, train_y_norm, val_x_norm, val_y_norm, epochs=500)
+    loaded_models = False
+    if os.path.exists(MODEL_FILE) and not FORCE_RETRAIN:
+        checkpoint = torch.load(MODEL_FILE, map_location="cpu", weights_only=False)
+        if checkpoint_matches_setup(checkpoint, input_size, output_size):
+            print("Loading trained models from", MODEL_FILE)
+            reference_physical = ReluMlp(
+                input_size,
+                hidden_layers=REFERENCE_HIDDEN_LAYERS,
+                neurons_per_layer=REFERENCE_NEURONS,
+                output_size=output_size,
+            )
+            candidate_physical = ReluMlp(
+                input_size,
+                hidden_layers=CANDIDATE_HIDDEN_LAYERS,
+                neurons_per_layer=CANDIDATE_NEURONS,
+                output_size=output_size,
+            )
+            try:
+                reference_physical.load_state_dict(checkpoint["reference"])
+                candidate_physical.load_state_dict(checkpoint["candidate"])
+                loaded_models = True
+            except RuntimeError:
+                print("Existing model file has incompatible weights")
+        else:
+            print("Existing model file is not compatible with the current setup")
 
-    print("Training candidate network")
-    train_model(candidate, train_x_norm, train_y_norm, val_x_norm, val_y_norm, epochs=100)
+    if not loaded_models:
+        print("Training reference network")
+        train_model(reference, train_x_norm, train_y_norm, val_x_norm, val_y_norm, epochs=500)
 
-    reference_physical = fold_normalization(reference, x_mean, x_std, y_mean, y_std)
-    candidate_physical = fold_normalization(candidate, x_mean, x_std, y_mean, y_std)
+        print("Training candidate network")
+        train_model(candidate, train_x_norm, train_y_norm, val_x_norm, val_y_norm, epochs=100)
+
+        reference_physical = fold_normalization(reference, x_mean, x_std, y_mean, y_std)
+        candidate_physical = fold_normalization(candidate, x_mean, x_std, y_mean, y_std)
+        save_models(reference_physical, candidate_physical, input_size, output_size)
+        print("Saved trained models to", MODEL_FILE)
 
     reference_weights, reference_biases = extract_weights_and_biases(reference_physical)
     candidate_weights, candidate_biases = extract_weights_and_biases(candidate_physical)
@@ -299,30 +629,75 @@ def main():
     print("Reference layers:", len(reference_weights))
     print("Candidate layers:", len(candidate_weights))
 
-    print("Solving certification MILP")
-    certification = solve_certification_milp(
-        reference_weights,
-        reference_biases,
-        candidate_weights,
-        candidate_biases,
-        horizon=CERTIFICATION_HORIZON,
-        window_length=T,
-        y_min=X_MIN,
-        y_max=X_MAX,
-        u_min=U_MIN,
-        u_max=U_MAX,
-        information_lower=information_lower,
-        information_upper=information_upper,
-        time_limit=MILP_TIME_LIMIT,
-        num_threads=MILP_THREADS,
-        show_solver_output=True,
+    print("Running gradient ascent for initial information")
+    initial_information, gradient_error = find_initial_information_with_gradient_ascent(
+        reference_physical,
+        candidate_physical,
+        information_lower,
+        information_upper,
+        restarts=GRADIENT_ASCENT_RESTARTS,
+        steps=GRADIENT_ASCENT_STEPS,
+        learning_rate=GRADIENT_ASCENT_LR,
     )
-    milp_result = certification["result"]
-    print("MILP success:", milp_result.success)
-    print("MILP status:", milp_result.status)
-    print("MILP message:", milp_result.message)
-    print("Certified objective:", certification["objective_value"])
-    print("MILP error bound P:", certification["error_bound"])
+    print("Gradient ascent initial error:", gradient_error)
+
+    if HORIZON_SWEEP:
+        certifications = []
+        for horizon in range(1, CERTIFICATION_HORIZON + 1):
+            certifications.append(
+                run_certification(
+                    reference_weights,
+                    reference_biases,
+                    candidate_weights,
+                    candidate_biases,
+                    information_lower,
+                    information_upper,
+                    initial_information,
+                    horizon,
+                )
+            )
+    else:
+        certifications = [
+            run_certification(
+                reference_weights,
+                reference_biases,
+                candidate_weights,
+                candidate_biases,
+                information_lower,
+                information_upper,
+                initial_information,
+                CERTIFICATION_HORIZON,
+            )
+        ]
+
+    final_certification = certifications[-1]
+    input_sequence = get_input_sequence_from_certification(final_certification)
+    if input_sequence is None:
+        print("No MILP solution available, plotting with zero future inputs")
+        fallback_steps = T + CERTIFICATION_HORIZON - 1
+        input_sequence = np.zeros((fallback_steps, 1), dtype=np.float32)
+    else:
+        print_input_sequence(input_sequence)
+
+    reference_outputs, candidate_outputs = rollout_reference_candidate(
+        reference_physical,
+        candidate_physical,
+        initial_information,
+        input_sequence,
+    )
+    plot_output_trajectory(
+        reference_outputs,
+        candidate_outputs,
+        final_certification["comparison_start"],
+        TRAJECTORY_PLOT_FILE,
+    )
+    print("Saved output trajectory plot to", TRAJECTORY_PLOT_FILE)
+    plot_input_sequence(
+        input_sequence,
+        final_certification["comparison_start"],
+        INPUT_PLOT_FILE,
+    )
+    print("Saved input sequence plot to", INPUT_PLOT_FILE)
 
     torch.save(
         {
@@ -342,6 +717,10 @@ def main():
                 "noise_std": NOISE_STD,
                 "input_size": input_size,
                 "output_size": output_size,
+                "reference_hidden_layers": REFERENCE_HIDDEN_LAYERS,
+                "reference_neurons": REFERENCE_NEURONS,
+                "candidate_hidden_layers": CANDIDATE_HIDDEN_LAYERS,
+                "candidate_neurons": CANDIDATE_NEURONS,
             },
         },
         "trained_models.pt",

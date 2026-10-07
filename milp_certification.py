@@ -4,6 +4,13 @@ import numpy as np
 from scipy.optimize import Bounds, LinearConstraint, milp
 from scipy.sparse import coo_matrix
 
+try:
+    import gurobipy as gp
+    from gurobipy import GRB
+except ImportError:
+    gp = None
+    GRB = None
+
 
 class VariableStore:
     def __init__(self):
@@ -68,6 +75,12 @@ class ConstraintStore:
             np.array(self.upper_bounds, dtype=float),
         )
 
+    def to_sparse_matrix(self, num_variables):
+        return coo_matrix(
+            (self.data, (self.rows, self.cols)),
+            shape=(len(self.lower_bounds), num_variables),
+        ).tocsr()
+
 
 def compute_network_bounds(weights, biases, input_lower, input_upper):
     z_lowers = []
@@ -127,6 +140,7 @@ def add_network_constraints(
     weights,
     biases,
     network_bounds,
+    big_m_value=None,
 ):
     z_lowers, z_uppers, h_lowers, h_uppers = network_bounds
     previous_variables = input_variables
@@ -179,6 +193,13 @@ def add_network_constraints(
                         0.0,
                     )
                 else:
+                    if big_m_value is None:
+                        upper_m = z_upper
+                        lower_m = -z_lower
+                    else:
+                        upper_m = float(big_m_value)
+                        lower_m = float(big_m_value)
+
                     delta = variables.add(
                         prefix + "_delta_" + str(layer_index) + "_" + str(i),
                         1,
@@ -193,7 +214,7 @@ def add_network_constraints(
                         np.inf,
                     )
                     constraints.add(
-                        [(h_variables[i], 1.0), (delta[0], -z_upper)],
+                        [(h_variables[i], 1.0), (delta[0], -upper_m)],
                         -np.inf,
                         0.0,
                     )
@@ -201,10 +222,10 @@ def add_network_constraints(
                         [
                             (h_variables[i], 1.0),
                             (z_variables[i], -1.0),
-                            (delta[0], -z_lower),
+                            (delta[0], lower_m),
                         ],
                         -np.inf,
-                        -z_lower,
+                        lower_m,
                     )
 
             previous_variables = h_variables
@@ -270,6 +291,156 @@ def add_information_dynamics(
             )
 
 
+def solve_with_scipy(
+    objective,
+    variables,
+    constraints,
+    time_limit,
+    num_threads,
+    mip_relative_gap,
+    show_solver_output,
+):
+    solver_options = {"time_limit": time_limit, "disp": show_solver_output}
+    if num_threads > 0:
+        solver_options["threads"] = num_threads
+    if mip_relative_gap is not None:
+        solver_options["mip_rel_gap"] = mip_relative_gap
+
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message="Unrecognized options detected: .*",
+            category=RuntimeWarning,
+        )
+        result = milp(
+            c=objective,
+            integrality=np.array(variables.integrality, dtype=int),
+            bounds=Bounds(
+                np.array(variables.lower_bounds, dtype=float),
+                np.array(variables.upper_bounds, dtype=float),
+            ),
+            constraints=constraints.to_linear_constraint(variables.size()),
+            options=solver_options,
+        )
+
+    if result.fun is None:
+        objective_value = None
+    else:
+        objective_value = -float(result.fun)
+
+    return result, objective_value, result.x
+
+
+def solve_with_gurobi(
+    objective,
+    variables,
+    constraints,
+    time_limit,
+    num_threads,
+    mip_relative_gap,
+    show_solver_output,
+):
+    if gp is None:
+        raise ImportError("gurobipy is not installed. Install Gurobi and gurobipy to use solver_backend='gurobi'.")
+
+    model = gp.Model("certification_milp")
+    model.Params.OutputFlag = 1 if show_solver_output else 0
+    if time_limit is not None:
+        model.Params.TimeLimit = float(time_limit)
+
+    if num_threads > 0:
+        model.Params.Threads = int(num_threads)
+    if mip_relative_gap is not None:
+        model.Params.MIPGap = float(mip_relative_gap)
+
+    gurobi_variables = []
+    for i in range(variables.size()):
+        lower_bound = variables.lower_bounds[i]
+        upper_bound = variables.upper_bounds[i]
+
+        if np.isneginf(lower_bound):
+            lower_bound = -GRB.INFINITY
+        if np.isposinf(upper_bound):
+            upper_bound = GRB.INFINITY
+
+        if variables.integrality[i] == 1:
+            variable_type = GRB.BINARY
+        else:
+            variable_type = GRB.CONTINUOUS
+
+        variable = model.addVar(
+            lb=float(lower_bound),
+            ub=float(upper_bound),
+            obj=float(objective[i]),
+            vtype=variable_type,
+            name="x_" + str(i),
+        )
+        gurobi_variables.append(variable)
+
+    matrix = constraints.to_sparse_matrix(variables.size())
+
+    for row in range(matrix.shape[0]):
+        start = matrix.indptr[row]
+        end = matrix.indptr[row + 1]
+        expression = gp.LinExpr()
+
+        for index, value in zip(matrix.indices[start:end], matrix.data[start:end]):
+            expression.addTerms(float(value), gurobi_variables[int(index)])
+
+        lower_bound = constraints.lower_bounds[row]
+        upper_bound = constraints.upper_bounds[row]
+
+        if np.isfinite(lower_bound) and np.isfinite(upper_bound) and lower_bound == upper_bound:
+            model.addConstr(expression == float(lower_bound), name="c_" + str(row))
+        else:
+            if np.isfinite(lower_bound):
+                model.addConstr(expression >= float(lower_bound), name="c_" + str(row) + "_lb")
+            if np.isfinite(upper_bound):
+                model.addConstr(expression <= float(upper_bound), name="c_" + str(row) + "_ub")
+
+    model.ModelSense = GRB.MINIMIZE
+    model.optimize()
+
+    if model.SolCount > 0:
+        objective_value = -float(model.ObjVal)
+        solution = np.array([variable.X for variable in gurobi_variables], dtype=float)
+    else:
+        objective_value = None
+        solution = None
+
+    return {
+        "success": model.Status == GRB.OPTIMAL,
+        "status": model.Status,
+        "message": status_to_string(model.Status),
+        "objective_value": objective_value,
+        "runtime": float(model.Runtime),
+        "mip_gap": float(model.MIPGap) if model.SolCount > 0 else None,
+        "solver": model,
+    }, objective_value, solution
+
+
+def status_to_string(status):
+    if GRB is None:
+        return str(status)
+
+    status_names = {
+        GRB.LOADED: "Loaded",
+        GRB.OPTIMAL: "Optimal",
+        GRB.INFEASIBLE: "Infeasible",
+        GRB.INF_OR_UNBD: "Infeasible or unbounded",
+        GRB.UNBOUNDED: "Unbounded",
+        GRB.CUTOFF: "Cutoff",
+        GRB.ITERATION_LIMIT: "Iteration limit",
+        GRB.NODE_LIMIT: "Node limit",
+        GRB.TIME_LIMIT: "Time limit",
+        GRB.SOLUTION_LIMIT: "Solution limit",
+        GRB.INTERRUPTED: "Interrupted",
+        GRB.NUMERIC: "Numeric issue",
+        GRB.SUBOPTIMAL: "Suboptimal",
+    }
+    return status_names.get(status, str(status))
+
+
 def solve_certification_milp(
     reference_weights,
     reference_biases,
@@ -283,12 +454,26 @@ def solve_certification_milp(
     u_max=2.0,
     information_lower=None,
     information_upper=None,
+    initial_information=None,
+    warmup_steps=None,
+    big_m_value=None,
+    error_bound=None,
     time_limit=600.0,
     num_threads=0,
+    mip_relative_gap=None,
+    solver_backend="gurobi",
     show_solver_output=False,
 ):
     if horizon <= 0:
         raise ValueError("horizon must be positive")
+    if big_m_value is not None and big_m_value <= 0.0:
+        raise ValueError("big_m_value must be positive")
+    if error_bound is not None and error_bound <= 0.0:
+        raise ValueError("error_bound must be positive")
+    if mip_relative_gap is not None and mip_relative_gap < 0.0:
+        raise ValueError("mip_relative_gap must be nonnegative")
+    if solver_backend not in ("gurobi", "scipy"):
+        raise ValueError("solver_backend must be 'gurobi' or 'scipy'")
 
     ny = reference_biases[-1].shape[0]
     reference_input_size = reference_weights[0].shape[1]
@@ -306,7 +491,14 @@ def solve_certification_milp(
 
     q = ny + nu
     information_size = window_length * q
-    last_time = window_length + horizon - 1
+
+    if warmup_steps is None:
+        warmup_steps = window_length
+    if warmup_steps < 0:
+        raise ValueError("warmup_steps must be nonnegative")
+
+    comparison_start = warmup_steps
+    last_time = warmup_steps + horizon - 1
 
     if information_lower is None or information_upper is None:
         information_lower, information_upper = build_information_bounds(
@@ -328,6 +520,15 @@ def solve_certification_milp(
         if np.any(information_lower > information_upper):
             raise ValueError("information_lower must be less than or equal to information_upper")
 
+    if initial_information is not None:
+        initial_information = np.array(initial_information, dtype=float).reshape(-1)
+        if initial_information.shape[0] != information_size:
+            raise ValueError("initial_information has the wrong size")
+        if np.any(initial_information < information_lower):
+            raise ValueError("initial_information is below information_lower")
+        if np.any(initial_information > information_upper):
+            raise ValueError("initial_information is above information_upper")
+
     reference_bounds = compute_network_bounds(
         reference_weights,
         reference_biases,
@@ -340,7 +541,10 @@ def solve_certification_milp(
         information_lower,
         information_upper,
     )
-    error_bound = estimate_error_bound(reference_bounds, candidate_bounds)
+    if error_bound is None:
+        error_bound = estimate_error_bound(reference_bounds, candidate_bounds)
+    else:
+        error_bound = float(error_bound)
 
     variables = VariableStore()
     constraints = ConstraintStore()
@@ -369,7 +573,7 @@ def solve_certification_milp(
     beta_plus_variables = {}
     beta_minus_variables = {}
 
-    for k in range(window_length, last_time + 1):
+    for k in range(comparison_start, last_time + 1):
         candidate_output_variables[k] = variables.add(
             "y_hat_" + str(k),
             ny,
@@ -392,6 +596,14 @@ def solve_certification_milp(
             integer=True,
         )
 
+    if initial_information is not None:
+        for i in range(information_size):
+            constraints.add(
+                [(information_variables[0][i], 1.0)],
+                initial_information[i],
+                initial_information[i],
+            )
+
     add_information_dynamics(
         constraints,
         information_variables,
@@ -412,9 +624,10 @@ def solve_certification_milp(
             reference_weights,
             reference_biases,
             reference_bounds,
+            big_m_value=big_m_value,
         )
 
-    for k in range(window_length, last_time + 1):
+    for k in range(comparison_start, last_time + 1):
         add_network_constraints(
             variables,
             constraints,
@@ -424,9 +637,10 @@ def solve_certification_milp(
             candidate_weights,
             candidate_biases,
             candidate_bounds,
+            big_m_value=big_m_value,
         )
 
-    for k in range(window_length, last_time + 1):
+    for k in range(comparison_start, last_time + 1):
         for i in range(ny):
             epsilon = epsilon_variables[k][0]
             reference_output = reference_output_variables[k][i]
@@ -472,40 +686,40 @@ def solve_certification_milp(
         constraints.add(beta_terms, 1.0, 1.0)
 
     objective = np.zeros(variables.size(), dtype=float)
-    for k in range(window_length, last_time + 1):
+    for k in range(comparison_start, last_time + 1):
         objective[epsilon_variables[k][0]] = -1.0
 
     if show_solver_output:
+        print("MILP solver backend:", solver_backend, flush=True)
+        print("MILP warmup steps:", warmup_steps, flush=True)
+        print("MILP fixed initial information:", initial_information is not None, flush=True)
         print("MILP variables:", variables.size(), flush=True)
         print("MILP constraints:", len(constraints.lower_bounds), flush=True)
         print("MILP binary variables:", int(sum(variables.integrality)), flush=True)
+        print("MILP ReLU big-M override:", big_m_value, flush=True)
         print("MILP error bound P:", error_bound, flush=True)
+        print("MILP relative gap tolerance:", mip_relative_gap, flush=True)
 
-    solver_options = {"time_limit": time_limit, "disp": show_solver_output}
-    if num_threads > 0:
-        solver_options["threads"] = num_threads
-
-    with warnings.catch_warnings():
-        warnings.filterwarnings(
-            "ignore",
-            message="Unrecognized options detected: .*",
-            category=RuntimeWarning,
+    if solver_backend == "gurobi":
+        result, objective_value, solution = solve_with_gurobi(
+            objective,
+            variables,
+            constraints,
+            time_limit,
+            num_threads,
+            mip_relative_gap,
+            show_solver_output,
         )
-        result = milp(
-            c=objective,
-            integrality=np.array(variables.integrality, dtype=int),
-            bounds=Bounds(
-                np.array(variables.lower_bounds, dtype=float),
-                np.array(variables.upper_bounds, dtype=float),
-            ),
-            constraints=constraints.to_linear_constraint(variables.size()),
-            options=solver_options,
-        )
-
-    if result.fun is None:
-        objective_value = None
     else:
-        objective_value = -float(result.fun)
+        result, objective_value, solution = solve_with_scipy(
+            objective,
+            variables,
+            constraints,
+            time_limit,
+            num_threads,
+            mip_relative_gap,
+            show_solver_output,
+        )
 
     return {
         "result": result,
@@ -517,4 +731,7 @@ def solve_certification_milp(
         "reference_output_variables": reference_output_variables,
         "candidate_output_variables": candidate_output_variables,
         "epsilon_variables": epsilon_variables,
+        "input_variables": input_variables,
+        "solution": solution,
+        "comparison_start": comparison_start,
     }
