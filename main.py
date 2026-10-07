@@ -17,7 +17,8 @@ from torch.utils.data import DataLoader, TensorDataset
 
 # Numerical setup from the paper.
 GUROBI_LICENSE_FILE = "/Users/marco/Downloads/gurobi (3).lic"
-os.environ["GRB_LICENSE_FILE"] = GUROBI_LICENSE_FILE
+if "GRB_LICENSE_FILE" not in os.environ and os.path.exists(GUROBI_LICENSE_FILE):
+    os.environ["GRB_LICENSE_FILE"] = GUROBI_LICENSE_FILE
 
 from milp_certification import solve_certification_milp
 
